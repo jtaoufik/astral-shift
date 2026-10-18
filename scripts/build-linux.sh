@@ -35,6 +35,7 @@ cp packaging/icon.png "$AD/.DirIcon"
 cp -R packaging/hicolor/. "$AD/usr/share/icons/hicolor/"
 
 echo "== appimagetool"
+command -v desktop-file-validate >/dev/null || { echo "install desktop-file-utils (apt) first" >&2; exit 1; }
 AIT="$TOOLS/appimagetool-$ARCH.AppImage"
 if [ ! -x "$AIT" ]; then
   curl -fsSL -o "$AIT" "https://github.com/AppImage/appimagetool/releases/download/1.9.0/appimagetool-$ARCH.AppImage"
