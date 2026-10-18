@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astral-shift"
+dynamic = ["version"]
+description = "Hold Shift while dragging a PDF or image: a radial wheel lets you convert, compress, crop, redact, annotate and more."
+readme = "README.md"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "Taoufik Jabbari" }]
+requires-python = ">=3.10"
+dependencies = [
+  "PySide6-Essentials>=6.7",
+  "pymupdf>=1.24.2",
+  "pillow>=10.1",
+  "pyobjc-framework-Cocoa>=10; sys_platform == 'darwin'",
+  "python-xlib>=0.33; sys_platform == 'linux'",
+]
+classifiers = [
+  "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Environment :: X11 Applications :: Qt",
+  "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+]
+
+[project.urls]
+Homepage = "https://astralpdf.com/desktop"
+Source = "https://github.com/jtaoufik/astral-shift"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-qt>=4.4", "pytest-cov>=5", "pyinstaller>=6.10"]
+
+[project.scripts]
+astral-shift = "astral_shift.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "astral_shift.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+addopts = "--cov=astral_shift --cov-report=term-missing --cov-fail-under=100"
+filterwarnings = ["ignore::DeprecationWarning"]
