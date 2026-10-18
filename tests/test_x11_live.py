@@ -39,5 +39,5 @@ def test_global_hotkey_fires(qtbot):
     hk = X11Hotkey(lambda: fired.append(1))
     assert hk.register(Qt.Key.Key_Space, Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier)
     xdotool("key", "ctrl+alt+space")
-    qtbot.waitUntil(lambda: fired, timeout=3000)
+    qtbot.waitUntil(lambda: bool(fired), timeout=3000)
     hk.unregister()
