@@ -65,8 +65,12 @@ if [ "${SKIP_NOTARIZE:-0}" = "1" ]; then echo "SKIP_NOTARIZE=1: done (not notari
 log "notarize"
 xcrun notarytool submit "$DMG" --key "$KEY" --key-id "$KEY_ID" --issuer "$ISSUER" --wait 2>&1 | tee build/notary.log
 grep -q 'status: Accepted' build/notary.log || { echo "notarization not accepted" >&2; exit 1; }
-xcrun stapler staple "$DMG"
-xcrun stapler validate "$DMG"
+# stapler talks to CloudKit, which drops connections now and then on CI runners: retry.
+for i in 1 2 3 4 5; do
+  if xcrun stapler staple "$DMG" && xcrun stapler validate "$DMG"; then break; fi
+  [ "$i" = 5 ] && { echo "stapling failed" >&2; exit 1; }
+  sleep 15
+done
 
 log "verify"
 MNT="$(mktemp -d)"
