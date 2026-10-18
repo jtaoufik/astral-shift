@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
-    QColor, QDragEnterEvent, QDragMoveEvent, QDropEvent, QFont, QPainter, QPainterPath,
+    QColor, QDragEnterEvent, QGuiApplication, QDragMoveEvent, QDropEvent, QFont, QPainter, QPainterPath,
     QPen, QRadialGradient,
 )
 from PySide6.QtWidgets import QWidget
@@ -105,7 +105,8 @@ class Wheel(QWidget):
         self._files = list(files or [])
         self.hover = None
         self.hint = ""
-        screen = self.screen().availableGeometry() if self.screen() else None
+        target = QGuiApplication.screenAt(global_pos)  # multi-monitor: the screen under the cursor
+        screen = target.availableGeometry() if target else None
         x, y = global_pos.x() - SIZE // 2, global_pos.y() - SIZE // 2
         if screen is not None:
             x = max(screen.left(), min(x, screen.right() - SIZE))

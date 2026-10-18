@@ -141,7 +141,7 @@ def test_dismiss_paths(qtbot):
 def test_popup_without_screen(qtbot, monkeypatch):
     w = Wh.Wheel()
     qtbot.addWidget(w)
-    monkeypatch.setattr(w, "screen", lambda: None)
+    monkeypatch.setattr(Wh.QGuiApplication, "screenAt", staticmethod(lambda pos: None))
     w.popup(QPoint(1000, 1000))
     assert w.pos() == QPoint(1000 - Wh.SIZE // 2, 1000 - Wh.SIZE // 2)
 
