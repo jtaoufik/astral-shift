@@ -6,7 +6,9 @@
     astral-shift rotate photo.jpg --degrees 90
     astral-shift background shot.png --preset ocean --ratio 16:9
     astral-shift metadata photo.jpg [--strip]
-    astral-shift wheel        # show the wheel at the cursor (bind it to a shortcut on Wayland)
+    astral-shift merge a.pdf b.pdf photo.jpg [--out all.pdf]
+    astral-shift split report.pdf
+    astral-shift wheel [files...]   # show the wheel (bind to a shortcut on Wayland)
 """
 from __future__ import annotations
 
@@ -60,7 +62,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("files", nargs="+", type=Path)
     s.add_argument("--strip", action="store_true")
 
-    sub.add_parser("wheel", help="ask the running app to show the wheel at the cursor")
+    s = sub.add_parser("merge", help="join PDFs and images into one PDF, in order")
+    s.add_argument("files", nargs="+", type=Path)
+    s.add_argument("--out", type=Path, help="output file (default: '<first> Merged.pdf')")
+
+    s = sub.add_parser("split", help="one PDF per page")
+    s.add_argument("files", nargs="+", type=Path)
+
+    s = sub.add_parser("wheel", help="show the wheel at the cursor, for these files if given (starts the app if needed)")
+    s.add_argument("files", nargs="*", type=Path)
     sub.add_parser("gui", help="start the app (default)")
     return p
 
@@ -68,6 +78,13 @@ def build_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> int:
     from . import ops
 
+    if args.cmd == "merge":
+        try:
+            print(ops.merge(args.files, args.out))
+            return 0
+        except Exception as e:
+            print(f"astral-shift: {e}", file=sys.stderr)
+            return 1
     status = 0
     for f in getattr(args, "files", []):
         try:
@@ -86,6 +103,8 @@ def run(args: argparse.Namespace) -> int:
                     raise ValueError(f"Unknown ratio {args.ratio}; one of {', '.join(ops.RATIOS)}")
                 bg = ops.Background(ops.PRESETS[args.preset], args.padding, args.radius, args.shadow, args.ratio)
                 outs = [ops.add_background(f, bg)]
+            elif args.cmd == "split":
+                outs = ops.split(f)
             elif args.cmd == "redact":
                 outs = [ops.redact(f, {args.page - 1: [_rect(args.rect)]})]
             elif args.cmd == "metadata":
@@ -112,11 +131,8 @@ def main(argv: list[str] | None = None) -> int:
         from .gui.app import run_app
         return run_app()
     if args.cmd == "wheel":
-        from .gui.single import send_to_running
-        if not send_to_running("wheel"):
-            print("astral-shift: the app is not running", file=sys.stderr)
-            return 1
-        return 0
+        from .gui.app import run_app
+        return run_app([f.resolve() for f in args.files])
     return run(args)
 
 

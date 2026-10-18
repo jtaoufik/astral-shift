@@ -10,6 +10,19 @@ from astral_shift.gui import autostart, single
 from astral_shift.gui.watcher import State
 
 
+class FakeHotkey:
+    def __init__(self):
+        self.accept = True
+        self.registered = None
+
+    def register(self, key, mods):
+        self.registered = (key, mods)
+        return self.accept
+
+    def unregister(self):
+        self.registered = None
+
+
 class Backend:
     def state(self):
         return State(False, False, 0)
@@ -22,7 +35,7 @@ class Backend:
 def core(qapp, tmp_path, monkeypatch):
     monkeypatch.setattr(autostart, "entry_path", lambda: tmp_path / "autostart" / "astral-shift.desktop")
     settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
-    c = A.AstralShift(qapp, settings=settings, backend=Backend())
+    c = A.AstralShift(qapp, settings=settings, backend=Backend(), hotkey_backend=FakeHotkey())
     c.pool = type("Inline", (), {"start": staticmethod(lambda task: task.run())})()  # coverage can't see QThreads
     yield c
     c.watcher.stop()
@@ -101,36 +114,23 @@ def test_tray_icon_per_platform(qapp, monkeypatch):
     assert not A.tray_icon().isNull()
 
 
-def test_menu_settings(core, tmp_path, monkeypatch):
-    menu_action(core, "PNG").trigger()
-    assert core.wheel.convert_target["pdf"] == "png"
-    menu_action(core, "Strong (smallest)").trigger()
-    assert core.compress_level == "high"
-    enabled = menu_action(core, "Enabled")
-    enabled.setChecked(False)
-    assert core.watcher.enabled is False
-    login = menu_action(core, "Open at Login")
-    login.setChecked(True)
-    assert autostart.entry_path().exists()
-    login.setChecked(False)
-    assert not autostart.entry_path().exists()
-
-    about = []
-    monkeypatch.setattr(A.QMessageBox, "about", lambda *a: about.append(a))
-    menu_action(core, f"About Astral Shift {A.__version__}").trigger()
-    assert "github.com/jtaoufik/astral-shift" in about[0][2]
+def test_tray_menu(core, monkeypatch):
+    opened = []
+    monkeypatch.setattr(A, "open_url", opened.append)
+    for name, url, _ in A.TOOLS:
+        menu_action(core, name).trigger()
+    menu_action(core, "Astral Shift on GitHub").trigger()
+    assert opened == [u for _, u, _ in A.TOOLS] + [A.GITHUB]
 
     shown = []
-    monkeypatch.setattr(core, "show_wheel", lambda sticky=False: shown.append(sticky))
+    monkeypatch.setattr(core, "show_wheel", lambda sticky=False, files=None: shown.append((sticky, files)))
     menu_action(core, "Show Wheel").trigger()
     monkeypatch.setattr(sys, "platform", "linux")
     core._tray_activated(QSystemTrayIcon.ActivationReason.Trigger)
     core._tray_activated(QSystemTrayIcon.ActivationReason.Context)
     monkeypatch.setattr(sys, "platform", "darwin")
     core._tray_activated(QSystemTrayIcon.ActivationReason.Trigger)  # macOS opens the menu instead
-    core.on_message("wheel")
-    core.on_message("other")
-    assert shown == [True, True, True]
+    assert shown == [(True, None), (True, None)]
 
     quits = []
     monkeypatch.setattr(core.app, "quit", lambda: quits.append(1))
@@ -138,9 +138,95 @@ def test_menu_settings(core, tmp_path, monkeypatch):
     assert quits == [1]
 
 
+def test_messages_and_hotkey(core, monkeypatch, jpg, tmp_path):
+    shown = []
+    monkeypatch.setattr(core, "show_wheel", lambda sticky=False, files=None: shown.append((sticky, files)))
+    core.on_message("wheel")
+    core.on_message(f"wheel\t{jpg}\t{tmp_path / 'notes.txt'}")
+    core.on_message("other")
+    monkeypatch.setattr(A.selection, "finder_selection", lambda: [jpg])
+    core.on_hotkey()
+    monkeypatch.setattr(A.selection, "finder_selection", lambda: [])
+    core.on_hotkey()
+    assert shown == [(True, None), (True, [jpg]), (True, [jpg]), (True, None)]
+
+
+def test_settings_window_applies_changes(core, qtbot, monkeypatch, tmp_path):
+    installed = []
+    monkeypatch.setattr(A.integrations, "set_installed", installed.append)
+    monkeypatch.setattr(A.integrations, "is_installed", lambda: False)
+    core.open_settings()
+    dlg = core.settings_dialog
+    assert dlg is not None and dlg.isVisible()
+    core.open_settings()  # second call reuses the window
+    assert core.settings_dialog is dlg
+
+    dlg.combos["convert/pdf"].setCurrentIndex(1)
+    assert core.wheel.convert_target["pdf"] == "png"
+    dlg.combos["compress/level"].setCurrentIndex(2)
+    assert core.compress_level == "high"
+    dlg.checks["enabled"].setChecked(False)
+    assert core.watcher.enabled is False
+    dlg.checks["context_menu"].setChecked(True)
+    assert installed == [True]
+    dlg.checks["login"].setChecked(True)
+    assert A.autostart.entry_path().exists()
+    dlg.checks["login"].setChecked(False)
+
+    from PySide6.QtGui import QKeySequence
+    dlg.shortcut.setKeySequence(QKeySequence("Ctrl+Alt+K"))
+    dlg._shortcut_done()
+    assert core.hotkey.text == "Ctrl+Alt+K"
+    assert dlg.shortcut_status.text() == core.hotkey_status()
+    dlg.close_btn.click()
+    assert core.settings_dialog is None
+    core.apply_setting("hotkey", "")  # no window open: still applied
+    assert core.hotkey.text == ""
+
+
+def test_hotkey_status_texts(core, monkeypatch):
+    core.hotkey.backend = None
+    assert "not available" in core.hotkey_status()
+    core.hotkey.backend = FakeHotkey()
+    core.hotkey.set("")
+    assert core.hotkey_status() == "No shortcut set."
+    core.hotkey.backend.accept = False
+    core.hotkey.set("Ctrl+K")
+    assert "taken" in core.hotkey_status()
+    core.hotkey.backend.accept = True
+    core.hotkey.set("Ctrl+K")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert "Finder" in core.hotkey_status()
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert "drop" in core.hotkey_status()
+
+
+def test_tips_every_two_months(core, monkeypatch):
+    from datetime import datetime, timedelta
+    shown = []
+    monkeypatch.setattr(A, "tips_due", lambda s: True)
+    core.maybe_show_tips()
+    assert core.tools_dialog is not None and core.tools_dialog.isVisible()
+    core.show_tips()  # already open: reused
+    core.tools_dialog.reject()
+    assert core.tools_dialog is None
+    assert core.settings.value("tips/last_shown")
+    monkeypatch.setattr(A, "tips_due", lambda s: False)
+    core.maybe_show_tips()
+    assert core.tools_dialog is None
+
+
+def test_is_wayland(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+    assert A.is_wayland()
+    monkeypatch.setenv("XDG_SESSION_TYPE", "x11")
+    assert not A.is_wayland()
+
+
 def test_unavailable_watcher_says_so(qapp, tmp_path):
     settings = QSettings(str(tmp_path / "s.ini"), QSettings.Format.IniFormat)
-    c = A.AstralShift(qapp, settings=settings, backend=None)
+    c = A.AstralShift(qapp, settings=settings, backend=None, hotkey_backend=None)
     assert menu_action(c, "Shift+drag is unavailable here: use Show Wheel") is not None
     c.tray.hide()
 
@@ -220,6 +306,16 @@ def test_dialog_actions(core, qtbot, jpg, tmp_path):
     assert core.toast.title.text() == "Could not open broken.pdf"
 
 
+def test_merge_action(core, qtbot, pdf, png, tmp_path):
+    core.run_action("merge", [pdf, png])
+    qtbot.waitUntil(lambda: bool(core._open_dialogs))
+    dlg = core._open_dialogs[0]
+    dlg._apply()
+    wait_done(qtbot, core)
+    assert core.toast.title.text() == "Merging done"
+    assert (tmp_path / "Page 001 Merged.pdf").exists()
+
+
 def test_task_failure_reaches_the_toast(core, qtbot, monkeypatch):
     class Exploding(A.Task):
         def run(self):
@@ -230,18 +326,47 @@ def test_task_failure_reaches_the_toast(core, qtbot, monkeypatch):
     assert core.toast.title.text() == "Something went wrong" and core.toast.detail.text() == "kaboom"
 
 
-def test_run_app(qapp, monkeypatch, tmp_path, capsys):
-    monkeypatch.setattr(A, "send_to_running", lambda msg: True)
-    assert A.run_app() == 0
+def test_run_app(qapp, monkeypatch, tmp_path, capsys, jpg):
+    sent = []
+    monkeypatch.setattr(A, "send_to_running", lambda msg: sent.append(msg) or True)
+    assert A.run_app([jpg]) == 0
+    assert sent == [f"wheel\t{jpg}"]
 
     monkeypatch.setattr(A, "send_to_running", lambda msg: False)
     monkeypatch.setattr(single, "NAME", f"astral-test-{tmp_path.name}")
     monkeypatch.setattr(A.QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: False))
     monkeypatch.setattr(A, "QSettings", lambda *a: QSettings(str(tmp_path / "s.ini"), QSettings.Format.IniFormat))
     monkeypatch.setattr(A.DragWatcher, "start", lambda self: None)
+    monkeypatch.setattr(A, "Hotkey", lambda parent, backend="auto": _NoHotkey(parent))
+    shown, messages = [], []
+    monkeypatch.setattr(A.AstralShift, "show_wheel", lambda self, sticky=False, files=None: shown.append(sticky))
+    monkeypatch.setattr(A.AstralShift, "on_message", lambda self, m: messages.append(m))
+
+    def exec_briefly(self):
+        QApplication.processEvents()
+        qwait(400)
+        return 0
+    monkeypatch.setattr(QApplication, "exec", exec_briefly)
     monkeypatch.setenv("ASTRAL_SHIFT_SHOW_WHEEL", "1")
-    shown = []
-    monkeypatch.setattr(A.AstralShift, "show_wheel", lambda self, sticky=False: shown.append(sticky))
-    monkeypatch.setattr(QApplication, "exec", lambda self: (QApplication.processEvents(), 0)[1])
     assert A.run_app() == 0
+    assert shown == [True]
+    assert A.run_app([jpg]) == 0
+    assert messages == [f"wheel\t{jpg}"]
     assert "no system tray" in capsys.readouterr().err
+
+
+def qwait(ms):
+    from PySide6.QtTest import QTest
+    QTest.qWait(ms)
+
+
+class _NoHotkey(A.QObject):
+    activated = A.Signal()
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.text, self.ok, self.available = "", False, False
+
+    def set(self, text):
+        self.text = text
+        return False

@@ -79,7 +79,7 @@ def test_drag_hover_and_drop(qtbot, pdf, jpg, tmp_path):
     got = []
     w.dropped.connect(lambda key, files: got.append((key, files)))
     drop(w, md, C)
-    assert got == [("annotate", [pdf, jpg])]
+    assert got == [("merge", [pdf, jpg])]  # two files: the centre merges
     assert not w.isVisible()
 
 
@@ -287,3 +287,45 @@ def test_draw_mode_every_tool(canvas):
     assert len(c.marks) == 3
     c.marks = []
     c.undo()  # nothing to undo is fine
+
+
+def test_merge_centre_when_several_files(qtbot, pdf, png):
+    w = Wh.Wheel()
+    qtbot.addWidget(w)
+    md = mime(pdf, png)
+    drag_enter(w, md)
+    drag_move(w, md, C)
+    assert w.hover == Wh.MERGE and w.hint == "Page 001 Merged.pdf"
+    w.grab()
+    got = []
+    w.dropped.connect(lambda key, files: got.append(key))
+    drop(w, md, C)
+    assert got == ["merge"]
+
+
+def test_click_mode_with_preset_files(qtbot, jpg):
+    w = Wh.Wheel()
+    qtbot.addWidget(w)
+    got = []
+    w.dropped.connect(lambda key, files: got.append((key, files)))
+    w.popup(QPoint(400, 400), files=[jpg])
+    assert w._sticky and w._preset
+    w.mouseMoveEvent(mouse("move", at_wedge(0), Qt.MouseButton.NoButton))
+    assert w.hover.key == "compress" and w.hint == "Photo.jpg"
+    w.mousePressEvent(mouse("press", at_wedge(0)))
+    assert got == [("compress", [jpg])] and not w.isVisible()
+    w.popup(QPoint(400, 400))  # no files: moving the mouse does nothing
+    w.mouseMoveEvent(mouse("move", at_wedge(0), Qt.MouseButton.NoButton))
+    assert w.hover is None
+
+
+def test_wheel_blur_requested_once(qtbot, monkeypatch):
+    calls = []
+    monkeypatch.setattr(Wh, "blur_behind", lambda *a: calls.append(a) or True)
+    w = Wh.Wheel()
+    qtbot.addWidget(w)
+    w.popup(QPoint(400, 400))
+    w.dismiss()
+    w.popup(QPoint(400, 400))
+    assert len(calls) == 1 and w.blurred
+    w.grab()

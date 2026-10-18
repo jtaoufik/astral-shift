@@ -60,18 +60,29 @@ def test_version(capsys):
 
 def test_no_args_starts_gui(monkeypatch):
     import astral_shift.gui.app as app
-    monkeypatch.setattr(app, "run_app", lambda: 7)
+    monkeypatch.setattr(app, "run_app", lambda files=None: 7)
     assert cli.main([]) == 7
     assert cli.main(["gui"]) == 7
 
 
-def test_wheel_command(monkeypatch, capsys):
-    import astral_shift.gui.single as single
-    monkeypatch.setattr(single, "send_to_running", lambda msg: False)
-    assert cli.main(["wheel"]) == 1
-    assert "not running" in capsys.readouterr().err
-    monkeypatch.setattr(single, "send_to_running", lambda msg: msg == "wheel")
+def test_wheel_command_passes_absolute_files(monkeypatch, jpg):
+    import astral_shift.gui.app as app
+    got = []
+    monkeypatch.setattr(app, "run_app", lambda files=None: got.append(files) or 0)
+    monkeypatch.chdir(jpg.parent)
+    assert cli.main(["wheel", jpg.name]) == 0
     assert cli.main(["wheel"]) == 0
+    assert got == [[jpg], []]
+
+
+def test_merge_and_split(pdf, png, tmp_path, capsys):
+    assert run("merge", pdf, png) == 0
+    assert run("merge", pdf, png, "--out", tmp_path / "all.pdf") == 0
+    assert run("split", pdf) == 0
+    names = [l.rsplit("/", 1)[-1] for l in capsys.readouterr().out.splitlines()]
+    assert names == ["Page 001 Merged.pdf", "all.pdf", "Page 001 p1.pdf", "Page 001 p2.pdf"]
+    assert run("merge", pdf) == 1
+    assert "at least two" in capsys.readouterr().err
 
 
 def test_module_entry_points(monkeypatch, jpg):

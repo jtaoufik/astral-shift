@@ -144,3 +144,31 @@ def test_row_helper_accepts_layouts():
     inner = D.QHBoxLayout()
     row = D._row(inner, None)
     assert row.count() == 2
+
+
+def test_merge_dialog_reorders(qtbot, pdf, png, one_page_pdf):
+    d = D.MergeDialog([pdf, png, one_page_pdf])
+    qtbot.addWidget(d)
+    d.list.setCurrentRow(0)
+    d._move(1)
+    assert [p.name for p in d.ordered()] == ["Logo.png", "Page 001.pdf", "Single.pdf"]
+    d._move(5)  # out of range: nothing
+    d.list.setCurrentRow(0)
+    d._move(-1)
+    assert d.ordered()[0].name == "Logo.png"
+    buttons = {b.text(): b for b in d.findChildren(D.QPushButton)}
+    buttons["Move Down"].click()
+    buttons["Move Up"].click()
+    buttons["Merge"].click()
+    [out] = run_job(d)
+    with pymupdf.open(out) as doc:
+        assert doc.page_count == 4
+
+
+def test_edit_dialog_splits_pdfs(qtbot, pdf, one_page_pdf):
+    d = open_(qtbot, D.EditDialog, pdf)
+    assert d.split_btn.isEnabled()
+    d.split_btn.click()
+    assert [p.name for p in run_job(d)] == ["Page 001 p1.pdf", "Page 001 p2.pdf"]
+    single = open_(qtbot, D.EditDialog, one_page_pdf)
+    assert not single.split_btn.isEnabled()

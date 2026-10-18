@@ -1,4 +1,4 @@
-"""Tray app: watches for Shift+drag, shows the wheel, runs the action."""
+"""Tray app: watches for Shift+drag and the shortcut, shows the wheel, runs the action."""
 from __future__ import annotations
 
 import os
@@ -8,25 +8,30 @@ import traceback
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QObject, QPoint, QRunnable, QSettings, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QIcon, QPainter, QPixmap
+from PySide6.QtCore import QObject, QPoint, QRectF, QRunnable, QSettings, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtGui import QColor, QCursor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QHBoxLayout, QLabel, QMenu, QMessageBox, QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget,
+    QApplication, QHBoxLayout, QLabel, QMenu, QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
-from .. import APP_ID, APP_NAME, __version__, ops
-from . import autostart, icons
-from .dialogs import DIALOGS
+from .. import APP_ID, APP_NAME, ops
+from . import autostart, icons, integrations, selection
+from .dialogs import DIALOGS, MergeDialog
+from .glass import blur_behind, paint_panel
+from .hotkey import DEFAULT as DEFAULT_HOTKEY, Hotkey
+from .settings import GITHUB, TOOLS, SettingsDialog, ToolsDialog, mark_tips_shown, open_url, tips_due
 from .single import Server, send_to_running
 from .style import QSS
 from .watcher import DragWatcher
-from .wheel import ALL, Wheel
+from .wheel import Wheel
 
 VERBS = {
     "convert": "Converting", "compress": "Compressing", "rotate": "Rotating", "crop": "Cropping",
     "background": "Adding background", "redact": "Redacting", "annotate": "Saving annotations",
-    "edit": "Saving edits", "metadata": "Cleaning metadata",
+    "edit": "Saving edits", "metadata": "Cleaning metadata", "merge": "Merging",
 }
+
+TIPS_CHECK_MS = 6 * 60 * 60 * 1000  # the app runs for weeks: look again every 6 hours
 
 
 def human_size(n: float) -> str:
@@ -43,6 +48,10 @@ def reveal(path: Path) -> None:
         subprocess.Popen(["open", "-R", str(path)])
     else:
         subprocess.Popen(["xdg-open", str(path.parent)])
+
+
+def is_wayland() -> bool:
+    return sys.platform.startswith("linux") and os.environ.get("XDG_SESSION_TYPE") == "wayland"
 
 
 # --- background work -----------------------------------------------------------------
@@ -70,7 +79,7 @@ class Task(QRunnable):
 # --- toast ------------------------------------------------------------------------------
 
 class Toast(QWidget):
-    """Small status card: "Converting to JPG… / 1 of 1 saved"."""
+    """Small glass status card: "Converting to JPG… / 1 of 1 saved"."""
 
     def __init__(self) -> None:
         super().__init__(None)
@@ -78,14 +87,8 @@ class Toast(QWidget):
                             | Qt.WindowType.Tool | Qt.WindowType.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        panel = QWidget(self)
-        panel.setObjectName("Panel")
-        panel.setStyleSheet("#Panel { border-radius: 12px; border: 1px solid rgba(0,0,0,0.08); }")
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(panel)
-        lay = QVBoxLayout(panel)
-        lay.setContentsMargins(14, 10, 14, 10)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 12, 14, 12)
         lay.setSpacing(2)
         self.title = QLabel()
         self.title.setStyleSheet("font-weight: 600;")
@@ -100,10 +103,17 @@ class Toast(QWidget):
         lay.addWidget(self.title)
         lay.addLayout(row)
         self.setFixedWidth(320)
+        self.blurred = False
         self._path: Path | None = None
         self._hide = QTimer(self)
         self._hide.setSingleShot(True)
         self._hide.timeout.connect(self.hide)
+
+    def paintEvent(self, _e) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        paint_panel(p, QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 14, self.blurred)
+        p.end()
 
     def _reveal(self) -> None:
         if self._path:
@@ -120,6 +130,8 @@ class Toast(QWidget):
         self.move(screen.right() - self.width() - 18, screen.top() + 18)
         self.show()
         self.raise_()
+        if not self.blurred:
+            self.blurred = blur_behind(self, 14)
         if sticky:
             self._hide.stop()
         else:
@@ -148,7 +160,7 @@ def tray_icon() -> QIcon:
 
 
 class AstralShift(QObject):
-    def __init__(self, app: QApplication, settings: QSettings | None = None, backend="auto") -> None:
+    def __init__(self, app: QApplication, settings: QSettings | None = None, backend="auto", hotkey_backend="auto") -> None:
         super().__init__()
         self.app = app
         self.settings = settings if settings is not None else QSettings("AstralPDF", "Astral Shift")
@@ -159,11 +171,21 @@ class AstralShift(QObject):
         self.watcher = DragWatcher(self, backend=backend)
         self.watcher.shift_drag.connect(self._on_shift_drag)
         self.watcher.released.connect(self.wheel.drag_released)
+        self.hotkey = Hotkey(self, backend=hotkey_backend)
+        self.hotkey.activated.connect(self.on_hotkey)
         self._open_dialogs: list = []
         self._tasks: list[Task] = []
+        self.settings_dialog: SettingsDialog | None = None
+        self.tools_dialog: ToolsDialog | None = None
         self._load_settings()
+        self.hotkey.set(str(self.settings.value("hotkey", DEFAULT_HOTKEY)))
         self._build_tray()
         self.watcher.start()
+        self._tips_timer = QTimer(self)
+        self._tips_timer.setInterval(TIPS_CHECK_MS)
+        self._tips_timer.timeout.connect(self.maybe_show_tips)
+        self._tips_timer.start()
+        QTimer.singleShot(4000, self.maybe_show_tips)
 
     # --- settings ---------------------------------------------------------------
 
@@ -175,9 +197,61 @@ class AstralShift(QObject):
         self.compress_level = str(self.settings.value("compress/level", "medium"))
         self.watcher.enabled = self.settings.value("enabled", True, type=bool)
 
-    def _set(self, key: str, value) -> None:
-        self.settings.setValue(key, value)
+    def hotkey_status(self) -> str:
+        if not self.hotkey.available:
+            return "A global shortcut is not available in this session."
+        if not self.hotkey.text:
+            return "No shortcut set."
+        if not self.hotkey.ok:
+            return "That shortcut is taken by another app or not supported. Try another one."
+        what = "selected Finder files" if sys.platform == "darwin" else "files you then drop on it"
+        return f"Opens the wheel for the {what}."
+
+    def apply_setting(self, key: str, value) -> None:
+        """Called by the settings window after it stored ``value``."""
+        if key == "hotkey":
+            self.hotkey.set(str(value))
+            if self.settings_dialog:
+                self.settings_dialog.set_shortcut_status(self.hotkey_status())
+        elif key == "context_menu":
+            integrations.set_installed(bool(value))
+        elif key == "login":
+            autostart.set_enabled(bool(value))
         self._load_settings()
+
+    def open_settings(self) -> None:
+        # The OS is the source of truth for these two.
+        self.settings.setValue("login", autostart.is_enabled())
+        self.settings.setValue("context_menu", integrations.is_installed())
+        if self.settings_dialog is None:
+            self.settings_dialog = SettingsDialog(self.settings, self.hotkey_status(), is_wayland())
+            self.settings_dialog.changed.connect(self.apply_setting)
+            self.settings_dialog.finished.connect(self._settings_closed)
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
+
+    def _settings_closed(self, _result: int) -> None:
+        self.settings_dialog.deleteLater()
+        self.settings_dialog = None
+
+    # --- Astral tools reminder ---------------------------------------------------------
+
+    def maybe_show_tips(self) -> None:
+        if tips_due(self.settings):
+            self.show_tips()
+
+    def show_tips(self) -> None:
+        mark_tips_shown(self.settings)
+        if self.tools_dialog is None:
+            self.tools_dialog = ToolsDialog()
+            self.tools_dialog.finished.connect(self._tips_closed)
+        self.tools_dialog.show()
+        self.tools_dialog.raise_()
+
+    def _tips_closed(self, _result: int) -> None:
+        self.tools_dialog.deleteLater()
+        self.tools_dialog = None
 
     # --- tray -------------------------------------------------------------------
 
@@ -185,45 +259,20 @@ class AstralShift(QObject):
         self.tray = QSystemTrayIcon(tray_icon(), self)
         self.tray.setToolTip(APP_NAME)
         menu = QMenu()
-        status = QAction(
+        status = menu.addAction(
             "Hold Shift while dragging a file" if self.watcher.available
-            else "Shift+drag is unavailable here: use Show Wheel", menu)
+            else "Shift+drag is unavailable here: use Show Wheel")
         status.setEnabled(False)
-        menu.addAction(status)
-        show = menu.addAction("Show Wheel")
-        show.triggered.connect(lambda: self.show_wheel(sticky=True))
-        enabled = menu.addAction("Enabled")
-        enabled.setCheckable(True)
-        enabled.setChecked(self.watcher.enabled)
-        enabled.setEnabled(self.watcher.available)
-        enabled.toggled.connect(lambda v: self._set("enabled", v))
+        menu.addAction(icons.icon("astral"), "Show Wheel").triggered.connect(lambda: self.show_wheel(sticky=True))
+        menu.addAction(icons.icon("settings"), "Settings…").triggered.connect(self.open_settings)
         menu.addSeparator()
-
-        def choice_menu(title: str, key: str, options: list[tuple[str, str]], current: str) -> None:
-            sub = menu.addMenu(title)
-            group = QActionGroup(sub)
-            for value, label in options:
-                a = sub.addAction(label)
-                a.setCheckable(True)
-                a.setChecked(value == current)
-                group.addAction(a)
-                a.triggered.connect(lambda _c=False, v=value: self._set(key, v))
-
-        choice_menu("PDFs convert to", "convert/pdf", [("jpg", "JPG"), ("png", "PNG"), ("webp", "WebP")],
-                    self.wheel.convert_target["pdf"])
-        choice_menu("Images convert to", "convert/image", [("pdf", "PDF"), ("png", "PNG"), ("jpg", "JPG"), ("webp", "WebP")],
-                    self.wheel.convert_target["image"])
-        choice_menu("Compression", "compress/level", [("low", "Light (best quality)"), ("medium", "Balanced"),
-                                                      ("high", "Strong (smallest)")], self.compress_level)
-        login = menu.addAction("Open at Login")
-        login.setCheckable(True)
-        login.setChecked(autostart.is_enabled())
-        login.toggled.connect(autostart.set_enabled)
+        tools = menu.addMenu(icons.icon("globe"), "Astral Tools")
+        for name, url, _blurb in TOOLS:
+            tools.addAction(name).triggered.connect(lambda _c=False, u=url: open_url(u))
+        tools.addSeparator()
+        tools.addAction("Astral Shift on GitHub").triggered.connect(lambda: open_url(GITHUB))
         menu.addSeparator()
-        about = menu.addAction(f"About {APP_NAME} {__version__}")
-        about.triggered.connect(self._about)
-        quit_ = menu.addAction("Quit")
-        quit_.triggered.connect(lambda: self.app.quit())
+        menu.addAction("Quit").triggered.connect(lambda: self.app.quit())
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._tray_activated)
         self._menu = menu
@@ -233,26 +282,22 @@ class AstralShift(QObject):
         if reason == QSystemTrayIcon.ActivationReason.Trigger and sys.platform != "darwin":
             self.show_wheel(sticky=True)
 
-    def _about(self) -> None:
-        QMessageBox.about(
-            None, APP_NAME,
-            f"<b>{APP_NAME} {__version__}</b><br>Hold Shift while dragging a PDF or image, drop it on the wheel."
-            f"<br><br>Free and open source (AGPL-3.0).<br>"
-            f"<a href='https://github.com/jtaoufik/astral-shift'>github.com/jtaoufik/astral-shift</a><br>"
-            f"<a href='https://astralpdf.com/desktop'>astralpdf.com/desktop</a>",
-        )
-
     # --- wheel ---------------------------------------------------------------------
 
     def _on_shift_drag(self, pos: QPoint) -> None:
         self.wheel.popup(pos)
 
-    def show_wheel(self, sticky: bool = False) -> None:
-        self.wheel.popup(QCursor.pos(), sticky=sticky)
+    def show_wheel(self, sticky: bool = False, files: list[Path] | None = None) -> None:
+        self.wheel.popup(QCursor.pos(), sticky=sticky, files=files)
+
+    def on_hotkey(self) -> None:
+        self.show_wheel(sticky=True, files=selection.finder_selection() or None)
 
     def on_message(self, msg: str) -> None:
-        if msg == "wheel":
-            self.show_wheel(sticky=True)
+        parts = msg.split("\t")
+        if parts[0] == "wheel":
+            files = [Path(p) for p in parts[1:] if p and ops.is_supported(Path(p))]
+            self.show_wheel(sticky=True, files=files or None)
 
     # --- actions ------------------------------------------------------------------
 
@@ -261,6 +306,9 @@ class AstralShift(QObject):
         QTimer.singleShot(0, lambda: self._run(key, files))
 
     def _run(self, key: str, files: list[Path]) -> None:
+        if key == "merge":
+            self._open_merge(files)
+            return
         if key in DIALOGS:
             for f in files:
                 self._open_dialog(key, f)
@@ -286,25 +334,31 @@ class AstralShift(QObject):
         target = self.wheel.convert_target[ops.kind(f)]
         return target if target in ops.targets_for(f) else ops.default_target(f)
 
-    def _open_dialog(self, key: str, f: Path) -> None:
-        try:
-            dlg = DIALOGS[key](f)
-        except Exception as e:
-            self.toast.show_message(f"Could not open {f.name}", str(e))
-            return
+    def _show_dialog(self, key: str, dlg, files: list[Path]) -> None:
         self._open_dialogs.append(dlg)
 
         def finished(result: int) -> None:
             self._open_dialogs.remove(dlg)
             if result and dlg.job:
                 job = dlg.job
-                self._start(key, f"{VERBS[key]}…", [f], lambda progress, _f: job())
+                self._start(key, f"{VERBS[key]}…", files[:1], lambda progress, _f: job())
             dlg.deleteLater()
 
         dlg.finished.connect(finished)
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
+
+    def _open_dialog(self, key: str, f: Path) -> None:
+        try:
+            dlg = DIALOGS[key](f)
+        except Exception as e:
+            self.toast.show_message(f"Could not open {f.name}", str(e))
+            return
+        self._show_dialog(key, dlg, [f])
+
+    def _open_merge(self, files: list[Path]) -> None:
+        self._show_dialog("merge", MergeDialog(files), files)
 
     def _start(self, key: str, title: str, files: list[Path], job) -> None:
         total = len(files)
@@ -344,8 +398,9 @@ class AstralShift(QObject):
         self.toast.show_message(title.rstrip("…") + " done", detail, path=outs[0] if outs else None)
 
 
-def run_app() -> int:
-    if send_to_running("wheel"):
+def run_app(files: list[Path] | None = None) -> int:
+    message = "\t".join(["wheel", *map(str, files or [])])
+    if send_to_running(message):
         return 0  # already running: the second launch just opens the wheel
     QApplication.setApplicationName(APP_NAME)
     QApplication.setOrganizationName("AstralPDF")
@@ -360,6 +415,8 @@ def run_app() -> int:
     server = Server(app)
     server.message.connect(core.on_message)
     server.listen()
-    if os.environ.get("ASTRAL_SHIFT_SHOW_WHEEL"):
+    if files:
+        QTimer.singleShot(300, lambda: core.on_message(message))
+    elif os.environ.get("ASTRAL_SHIFT_SHOW_WHEEL"):
         QTimer.singleShot(300, lambda: core.show_wheel(sticky=True))
     return app.exec()

@@ -10,13 +10,14 @@ from PIL import Image
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import (
-    QButtonGroup, QCheckBox, QDialog, QGridLayout, QHBoxLayout, QHeaderView, QInputDialog,
-    QLabel, QPushButton, QSlider, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QButtonGroup, QCheckBox, QDialog, QGridLayout, QHBoxLayout, QHeaderView, QInputDialog,
+    QLabel, QListWidget, QListWidgetItem, QPushButton, QSlider, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .. import ops
 from . import icons
 from .canvas import Document, PageCanvas, pil_to_qimage
+from .glass import GlassDialog
 
 Job = Callable[[], list[Path]]
 
@@ -59,22 +60,14 @@ def _slider(lo: int, hi: int, value: int) -> QSlider:
     return s
 
 
-class Base(QDialog):
+class Base(GlassDialog):
     title = ""
 
     def __init__(self, path: Path, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
+        super().__init__(self.title, parent)
         self.path = Path(path)
         self.job: Job | None = None
         self.setWindowTitle(f"{self.title}: {self.path.name}")
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        self.layout_ = QVBoxLayout(self)
-        self.layout_.setContentsMargins(16, 14, 16, 14)
-        self.layout_.setSpacing(10)
-        head = QLabel(self.title)
-        head.setObjectName("Title")
-        head.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.layout_.addWidget(head)
 
     def footer(self, primary: str, on_primary, reset=None) -> QPushButton:
         go = QPushButton(primary)
@@ -156,7 +149,7 @@ class CropDialog(Base):
     def __init__(self, path: Path, parent: QWidget | None = None) -> None:
         super().__init__(path, parent)
         if ops.kind(self.path) == "pdf":
-            self.setWindowTitle(f"Crop PDF: {self.path.name}")
+            self.title_label.setText("Crop PDF")
         self.doc = Document(self.path)
         self.canvas = PageCanvas("crop")
         self.canvas.set_image(self.doc.page(0))
@@ -451,6 +444,10 @@ class EditDialog(Base):
             note = QLabel("PDF pages stay sharp: only rotation applies to PDFs.")
             note.setObjectName("Muted")
             self.layout_.addWidget(note)
+            self.split_btn = QPushButton("Split into Pages")
+            self.split_btn.clicked.connect(lambda: self.done_with(lambda: ops.split(self.path)))
+            self.split_btn.setEnabled(Document(self.path).count > 1)
+            self.layout_.addLayout(_row(None, self.split_btn, None))
         self.footer("Save", self._apply, reset=self._reset)
         self._render()
         self.resize(600, 700)
@@ -511,6 +508,58 @@ class MetadataDialog(Base):
         self.layout_.addWidget(note)
         self.footer("Save Clean Copy", lambda: self.done_with(lambda: [ops.strip_metadata(self.path)]))
         self.resize(560, 520)
+
+
+# --- merge ---------------------------------------------------------------------------------
+
+class MergeDialog(GlassDialog):
+    """Order the dropped files, then join them into one PDF."""
+
+    def __init__(self, files: list[Path], parent: QWidget | None = None) -> None:
+        super().__init__("Merge into PDF", parent)
+        self.files = [Path(f) for f in files]
+        self.job: Job | None = None
+        hint = QLabel("Drag to reorder. PDFs and images become one PDF, in this order.")
+        hint.setObjectName("Muted")
+        hint.setWordWrap(True)
+        self.layout_.addWidget(hint)
+        self.list = QListWidget()
+        self.list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.list.setMinimumSize(380, 260)
+        for f in self.files:
+            item = QListWidgetItem(icons.icon("file" if ops.kind(f) == "pdf" else "background"), f.name)
+            item.setData(0x0100, str(f))  # Qt.UserRole
+            self.list.addItem(item)
+        self.list.setCurrentRow(0)
+        self.layout_.addWidget(self.list, 1)
+        up = QPushButton("Move Up")
+        up.clicked.connect(lambda: self._move(-1))
+        down = QPushButton("Move Down")
+        down.clicked.connect(lambda: self._move(1))
+        self.layout_.addLayout(_row(up, down, None))
+        go = QPushButton("Merge")
+        go.setObjectName("Primary")
+        go.clicked.connect(self._apply)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        self.layout_.addLayout(_row(cancel, None, go))
+        self.resize(460, 460)
+
+    def ordered(self) -> list[Path]:
+        return [Path(self.list.item(i).data(0x0100)) for i in range(self.list.count())]
+
+    def _move(self, step: int) -> None:
+        row = self.list.currentRow()
+        to = row + step
+        if 0 <= to < self.list.count():
+            item = self.list.takeItem(row)
+            self.list.insertItem(to, item)
+            self.list.setCurrentRow(to)
+
+    def _apply(self) -> None:
+        files = self.ordered()
+        self.job = lambda: [ops.merge(files)]
+        self.accept()
 
 
 DIALOGS = {

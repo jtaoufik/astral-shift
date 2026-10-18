@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QWidget
 
 from .. import ops
 from . import icons
+from .glass import blur_behind
 
 
 @dataclass(frozen=True)
@@ -35,7 +36,8 @@ RING = [
     Action("redact", "REDACT"),
 ]
 CENTER = Action("annotate", "ANNOTATE")
-ALL = RING + [CENTER]
+MERGE = Action("merge", "MERGE")  # the centre when several files are dropped
+ALL = RING + [CENTER, MERGE]
 
 SIZE = 360
 OUTER = 168
@@ -50,12 +52,12 @@ def local_files(event) -> list[Path]:
     return [Path(u.toLocalFile()) for u in md.urls() if u.isLocalFile() and ops.is_supported(Path(u.toLocalFile()))]
 
 
-def hit_test(p: QPointF, center: QPointF) -> Action | None:
+def hit_test(p: QPointF, center: QPointF, many: bool = False) -> Action | None:
     """Which action sits under ``p`` (widget coordinates)."""
     dx, dy = p.x() - center.x(), p.y() - center.y()
     r = math.hypot(dx, dy)
     if r <= INNER:
-        return CENTER
+        return MERGE if many else CENTER
     if r > OUTER + 6:
         return None
     # 0 deg = top, clockwise.
@@ -84,17 +86,23 @@ class Wheel(QWidget):
         self.hover: Action | None = None
         self.hint = ""  # e.g. "Page 001.jpg", shown on the hovered wedge
         self._files: list[Path] = []
+        self._preset = False
         self.convert_target = {"pdf": "jpg", "image": "pdf"}
         self._opacity = 0.0
         self._fade = QTimer(self)
         self._fade.setInterval(12)
         self._fade.timeout.connect(self._step_fade)
         self._sticky = False  # opened from the tray: stay until Esc / click outside
+        self.blurred = False
+        self.setMouseTracking(True)
 
     # --- showing --------------------------------------------------------------
 
-    def popup(self, global_pos: QPoint, sticky: bool = False) -> None:
-        self._sticky = sticky
+    def popup(self, global_pos: QPoint, sticky: bool = False, files: list[Path] | None = None) -> None:
+        """Show at ``global_pos``. With ``files``, a click on a wedge acts on them."""
+        self._sticky = sticky or bool(files)
+        self._preset = bool(files)
+        self._files = list(files or [])
         self.hover = None
         self.hint = ""
         screen = self.screen().availableGeometry() if self.screen() else None
@@ -108,7 +116,10 @@ class Wheel(QWidget):
         self.show()
         self.raise_()
         self._fade.start()
-        if sticky:
+        if not self.blurred:
+            ring = OUTER + 10
+            self.blurred = blur_behind(self, ring, SIZE / 2 - ring)
+        if self._sticky:
             self.setWindowFlag(Qt.WindowType.WindowDoesNotAcceptFocus, False)
             self.show()
             self.activateWindow()
@@ -137,6 +148,8 @@ class Wheel(QWidget):
             return ""
         f = self._files[0]
         extra = f" +{len(self._files) - 1}" if len(self._files) > 1 else ""
+        if action.key == "merge":
+            return f"{f.stem} Merged.pdf"
         if action.key == "convert":
             target = self.convert_target[ops.kind(f)]
             if target not in ops.targets_for(f):
@@ -154,12 +167,18 @@ class Wheel(QWidget):
         else:
             e.ignore()
 
-    def dragMoveEvent(self, e: QDragMoveEvent) -> None:
-        action = hit_test(e.position(), QPointF(SIZE / 2, SIZE / 2))
+    def _hit(self, pos: QPointF) -> Action | None:
+        return hit_test(pos, QPointF(SIZE / 2, SIZE / 2), many=len(self._files) > 1)
+
+    def _set_hover(self, action: Action | None) -> None:
         if action != self.hover:
             self.hover = action
             self.hint = self._hint_for(action)
             self.update()
+
+    def dragMoveEvent(self, e: QDragMoveEvent) -> None:
+        action = self._hit(e.position())
+        self._set_hover(action)
         if action:
             e.acceptProposedAction()
         else:
@@ -171,8 +190,8 @@ class Wheel(QWidget):
         self.update()
 
     def dropEvent(self, e: QDropEvent) -> None:
-        action = hit_test(e.position(), QPointF(SIZE / 2, SIZE / 2))
         files = local_files(e)
+        action = hit_test(e.position(), QPointF(SIZE / 2, SIZE / 2), many=len(files) > 1)
         if action and files:
             e.acceptProposedAction()
             self.dropped.emit(action.key, files)
@@ -182,9 +201,18 @@ class Wheel(QWidget):
         if e.key() == Qt.Key.Key_Escape:
             self.dismiss()
 
+    def mouseMoveEvent(self, e) -> None:
+        if self._preset:
+            self._set_hover(self._hit(e.position()))
+
     def mousePressEvent(self, e) -> None:
-        if hit_test(e.position(), QPointF(SIZE / 2, SIZE / 2)) is None:
+        action = self._hit(e.position())
+        if action is None:
             self.dismiss()
+        elif self._preset:
+            files = list(self._files)
+            self.dismiss()
+            self.dropped.emit(action.key, files)
 
     def focusOutEvent(self, e) -> None:
         if self._sticky:
@@ -200,7 +228,7 @@ class Wheel(QWidget):
         # Soft glass disc.
         glow = QRadialGradient(c, OUTER + 10)
         glow.setColorAt(0.0, QColor(255, 255, 255, 120))
-        glow.setColorAt(0.85, QColor(255, 236, 225, 150))
+        glow.setColorAt(0.85, QColor(255, 236, 225, 90 if self.blurred else 150))
         glow.setColorAt(1.0, QColor(255, 255, 255, 0))
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(glow)
@@ -239,16 +267,17 @@ class Wheel(QWidget):
             p.setPen(QColor(color))
             p.drawText(QRectF(pos.x() - 45, pos.y() + 4, 90, 14), Qt.AlignmentFlag.AlignCenter, action.label)
 
-        # Centre button.
-        hovered = self.hover == CENTER
+        # Centre button: annotate one file, merge several.
+        centre = MERGE if len(self._files) > 1 else CENTER
+        hovered = self.hover == centre
         p.setPen(QPen(QColor(255, 255, 255, 220), 1.2))
         p.setBrush(QColor(232, 68, 40, 240) if hovered else QColor(255, 236, 224, 235))
         p.drawEllipse(c, INNER, INNER)
         color = "#ffffff" if hovered else "#4a2c22"
-        p.drawImage(QRectF(c.x() - 11, c.y() - 22, 22, 22), icons.image("annotate", 44, color, 1.9))
+        p.drawImage(QRectF(c.x() - 11, c.y() - 22, 22, 22), icons.image(centre.key, 44, color, 1.9))
         p.setFont(label_font)
         p.setPen(QColor(color))
-        p.drawText(QRectF(c.x() - 50, c.y() + 2, 100, 14), Qt.AlignmentFlag.AlignCenter, CENTER.label)
+        p.drawText(QRectF(c.x() - 50, c.y() + 2, 100, 14), Qt.AlignmentFlag.AlignCenter, centre.label)
 
         # File-name pill on the hovered wedge, like the result's name.
         if self.hint:

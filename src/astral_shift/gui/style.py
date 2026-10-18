@@ -4,11 +4,17 @@ ACCENT = "#e8442a"
 INK = "#3a2a28"
 
 QSS = f"""
-QDialog, QWidget#Panel {{
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #fff1e8, stop:1 #ffe1d2);
-    color: {INK};
-    font-size: 13px;
+QDialog {{ background: transparent; color: {INK}; font-size: 13px; }}
+QPushButton#Close {{
+    background: rgba(0,0,0,0.08); border: none; border-radius: 11px; padding: 0;
+    font-size: 11px; color: #6b4f46;
 }}
+QPushButton#Close:hover {{ background: {ACCENT}; color: white; }}
+QFrame#Card {{ background: rgba(255,255,255,0.55); border: 1px solid rgba(255,255,255,0.8); border-radius: 12px; }}
+QListWidget {{ background: rgba(255,255,255,0.55); border: 1px solid rgba(255,255,255,0.8); border-radius: 10px; padding: 4px; }}
+QListWidget::item {{ padding: 6px; border-radius: 6px; }}
+QListWidget::item:selected {{ background: rgba(232,68,42,0.18); color: {INK}; }}
+QKeySequenceEdit, QComboBox {{ background: white; border: 1px solid rgba(0,0,0,0.12); border-radius: 6px; padding: 3px 6px; }}
 QLabel {{ color: {INK}; background: transparent; }}
 QLabel#Title {{ font-size: 15px; font-weight: 600; }}
 QLabel#Muted {{ color: #8a6d63; font-size: 12px; }}
@@ -30,5 +36,7 @@ QSlider::handle:horizontal {{ background: white; border: 1px solid rgba(0,0,0,0.
 QLineEdit, QSpinBox {{ background: white; border: 1px solid rgba(0,0,0,0.12); border-radius: 6px; padding: 3px 6px; }}
 QTableWidget {{ background: rgba(255,255,255,0.8); border: 1px solid rgba(0,0,0,0.08); border-radius: 8px; gridline-color: rgba(0,0,0,0.06); }}
 QHeaderView::section {{ background: transparent; border: none; font-weight: 600; padding: 4px; }}
-QCheckBox {{ background: transparent; }}
+QCheckBox {{ background: transparent; spacing: 8px; }}
+QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 5px; border: 1px solid rgba(0,0,0,0.25); background: rgba(255,255,255,0.85); }}
+QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
 """
